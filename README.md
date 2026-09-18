@@ -1,6 +1,28 @@
 # aws-eks-cluster
 Minimal Amazon EKS cluster provisioned with Terraform.
 
+## Architecture decisions
+
+### Why each capability is an orphan branch, not a feature flag
+
+`main` is the bare cluster; the other 16 branches are complete, independently applyable copies — 17 root commits, no shared merge base. I rejected a single branch with `count = var.enable_karpenter ? 1 : 0` toggles: every plan would evaluate every capability, the variable surface would be the union of all 16, and a Karpenter IAM change could break a Fargate-only apply. The cost is real — a fix to `eks.tf` has to be replayed by hand, since there is no merge path — but each branch stands alone: `fargate-full` has no `nodes.tf` at all.
+
+### Why access entries replaced the aws-auth ConfigMap
+
+`access_entries.tf` registers the node role as `EC2_LINUX`, and all four addons in `addons.tf` `depends_on` it. The ConfigMap path is still here, commented out in `aws-auth.tf`, down to the old `# kubernetes_config_map.aws-auth` in the node group's `depends_on`. It routes node bootstrap through the Kubernetes provider, so the apply needs a live API endpoint and a token from `data.aws_eks_cluster_auth.default`, and one bad edit locks every principal out with no AWS-side recovery. I kept `API_AND_CONFIG_MAP` rather than `API` so an inherited ConfigMap still resolves.
+
+### Why the network arrives via SSM, with pods in their own tier
+
+`data.tf` reads VPC and subnet IDs from SSM parameters. `terraform_remote_state` would demand read access to the whole network state file and couple this stack to that stack's outputs and backend. The contract is wider than `main` needs on purpose: `data.aws_ssm_parameter.vpc` and `.public_subnets` resolve but are never consumed here, so branches pick them up without editing `data.tf`. `eks.tf` puts the cluster ENIs in `private_subnets` while `nodes.tf` puts the node group in `pod_subnets`, so pod IP churn cannot exhaust the CIDR the control plane needs.
+
+### Why Terraform declares capacity once and then lets go
+
+`nodes.tf` carries `ignore_changes = [scaling_config[0].desired_size]`. If Terraform owned `desired_size`, any unrelated apply would snap a loaded cluster back to `auto_scale_options.desired` — that value belongs to whatever scales at runtime; I keep only min/max as policy. The `1h` create and `2h` delete timeouts exist because node group deletion blocks on pod eviction, and a default timeout leaves a half-deleted group in state.
+
+### Why metrics ship in the base cluster, not an observability branch
+
+`helm_metrics_server.tf` and `helm_kube_state_metrics.tf` live in `main`, not only on the `prometheus` branch that adds `helm_prometheus.tf`. `assets/chip-primeira-aula.yml` ships an HPA targeting 60% CPU: without metrics-server in the base it reports `<unknown>` and never scales. `wait = false` on the metrics-server release is deliberate — it installs in the same apply that creates the node group, and an ACTIVE node group is not the same as joined, Ready nodes. The `nodes=[*]` label allowlist on kube-state-metrics turns node labels into queryable metrics, so the `capacity/type` and `capacity/arch` labels on the `node-groups` branch become comparable.
+
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
 
